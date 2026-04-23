@@ -2,8 +2,6 @@ import express from 'express';
 import multer from 'multer';
 import dotenv from 'dotenv';
 import cors from 'cors';
-import fs from 'fs';
-import path from 'path';
 import { GoogleGenAI } from '@google/genai';
 
 dotenv.config();
@@ -21,141 +19,98 @@ const upload = multer({ storage: multer.memoryStorage() });
 // Автоматически берет GEMINI_API_KEY из process.env
 const ai = new GoogleGenAI({});
 
-// Ультимативные промпты для физики чернил и материалов
-const PRINT_PROMPTS = {
-    'B2': 'Silk screen printing effect (Plastisol ink). The ink has a slight physical thickness and a matte finish. The cotton fabric weave is subtly visible underneath. Natural stretching and micro-cracking around deep folds.',
-    'D2': 'Silk screen printing with transfer. High opacity ink, crisp edges, very slight rubbery texture reflecting soft studio light. Deeply integrated into the fabric surface.',
-    'DTF3': 'Direct-to-Film (DTF) transfer print. Vibrant, highly saturated colors. The print sits on top of the fabric with a very smooth, micro-textured semi-matte surface. Sharp vector-like boundaries.',
-    'F1': 'Polyurethane heat transfer vinyl (Flex film). Solid, perfectly uniform colors with a distinct semi-gloss reflection. The material is thick enough to hide the fabric weave completely. Razor-sharp die-cut edges.',
-    'F2': 'Premium heat transfer vinyl (Flex film). Solid uniform colors, slight semi-gloss reflection under studio lights. Razor-sharp edges, perfectly bonded to the garment shape without losing its vinyl texture.',
-    'DTG2': 'Direct-to-Garment (DTG) water-based ink print. The ink is completely absorbed deep into the cotton fibers. Zero physical thickness. The fabric texture and grain are fully visible through the colors. Very soft, breathable appearance, slightly muted vintage color profile.'
+// Профили печати с явными "MUST" ограничениями, чтобы модель не усредняла стиль
+const PRINT_PROFILES = {
+    B2: {
+        label: 'B2 / Screen print plastisol',
+        prompt: 'MUST look like plastisol screen printing: matte ink, slight physical thickness, subtle micro-cracks on deep folds, visible cotton weave through ink.',
+        boost: 'Emphasize tactile matte ink body and subtle edge buildup. Keep colors slightly dense, not glossy.',
+    },
+    D2: {
+        label: 'D2 / Screen print transfer',
+        prompt: 'MUST look like transfer-based screen print: high-opacity ink, crisp edges, slightly rubberized surface, soft studio reflections, tightly bonded to fabric.',
+        boost: 'Emphasize clean transfer edges and uniform opacity with mild rubber-like reflectance.',
+    },
+    DTF3: {
+        label: 'DTF3 / Direct-to-Film',
+        prompt: 'MUST look like DTF transfer: vibrant saturated colors, smooth micro-textured semi-matte surface, clear top-layer feel above fabric, sharp vector-like boundaries.',
+        boost: 'Increase color saturation and contrast on print area only; preserve garment color outside print.',
+    },
+    F1: {
+        label: 'F1 / Flex vinyl',
+        prompt: 'MUST look like polyurethane flex vinyl: solid uniform fills, distinct semi-gloss reflections, thicker film appearance, razor-sharp die-cut edges.',
+        boost: 'Add stronger specular highlights on the print surface to show vinyl film behavior.',
+    },
+    F2: {
+        label: 'F2 / Premium flex vinyl',
+        prompt: 'MUST look like premium heat-transfer vinyl: smooth uniform color fields, clean semi-gloss highlights, crisp contour edges, bonded while retaining vinyl character.',
+        boost: 'Keep premium clean finish: controlled semi-gloss highlights, very crisp clean contours, no ink bleed.',
+    },
+    DTG2: {
+        label: 'DTG2 / Water-based DTG',
+        prompt: 'MUST look like water-based DTG print: zero physical thickness, ink absorbed deeply into cotton fibers, fabric grain fully visible through print, slightly muted vintage tones.',
+        boost: 'Reduce print saturation slightly and avoid specular shine; prioritize absorbed-ink softness and breathable look.',
+    },
 };
 
 app.post('/api/apply-print', upload.single('garmentImage'), async (req, res) => {
     try {
         const file = req.file;
-        const { printType, modelGender, garmentColor } = req.body;
+        const printTypeRaw = req.body.printType;
+        const modelGender = (req.body.modelGender || 'man').toLowerCase();
 
         if (!file) {
             return res.status(400).json({ error: 'Missing garmentImage.' });
         }
 
-        if (!printType || !PRINT_PROMPTS[printType]) {
+        const printType = (printTypeRaw || '').toUpperCase().trim();
+
+        if (!printType || !PRINT_PROFILES[printType]) {
             return res.status(400).json({ 
-                error: `Invalid or missing printType. Supported: ${Object.keys(PRINT_PROMPTS).join(', ')}` 
+                error: `Invalid or missing printType. Supported: ${Object.keys(PRINT_PROFILES).join(', ')}` 
             });
         }
 
-        if (!modelGender || !garmentColor) {
-            return res.status(400).json({ error: 'Missing modelGender or garmentColor.' });
+        if (!['man', 'woman'].includes(modelGender)) {
+            return res.status(400).json({ error: 'Invalid modelGender. Supported: man, woman.' });
         }
 
         const garmentBuffer = file.buffer;
         const mimeTypeIn = file.mimetype || 'image/jpeg';
-
-        // Определяем тип модели, пол, одежду и позу на основе входящего параметра
-        // Поддерживаем как старый modelGender, так и новые расширенные типы
-        const modelType = (req.body.modelType || req.body.modelGender || 'man').toLowerCase();
         
-        let gender = 'man';
-        let garmentDescription = 't-shirt';
-        let poseDescription = 'facing the camera, showing the front of the garment';
-        let refFileName = 'man_black_chest.png'; // Дефолтный референс
-
-        switch (modelType) {
-            case 'woman':
-            case 'woman_shirt_front':
-                gender = 'woman';
-                refFileName = 'model-female.jpg';
-                break;
-            case 'man_shirt_back':
-                gender = 'man';
-                refFileName = 'man_black_chest.png'; // Берем тот же референс, но просим повернуть
-                poseDescription = 'TURNED AROUND, facing AWAY from the camera, showing the BACK of the t-shirt. The model must be viewed from behind.';
-                break;
-            case 'woman_shirt_back':
-                gender = 'woman';
-                refFileName = 'model-female.jpg'; // Берем женский референс, но просим повернуть
-                poseDescription = 'TURNED AROUND, facing AWAY from the camera, showing the BACK of the t-shirt. The model must be viewed from behind.';
-                break;
-            case 'man_jacket':
-                gender = 'man';
-                refFileName = 'man_black_chest.png'; // Берем тот же референс, но переодеваем
-                garmentDescription = 'sleeveless puffer jacket (vest)';
-                break;
-            case 'woman_jacket':
-                gender = 'woman';
-                refFileName = 'model-female.jpg'; // Берем женский референс, но переодеваем
-                garmentDescription = 'sleeveless puffer jacket (vest)';
-                break;
-            case 'man':
-            case 'man_shirt_front':
-            default:
-                gender = 'man';
-                refFileName = 'man_black_chest.png';
-                break;
-        }
-
-        // Ищем референсную фотографию
-        let referenceImageBuffer = null;
-        let referenceMimeType = refFileName.endsWith('.png') ? 'image/png' : 'image/jpeg';
-        
-        const refPath = path.join(process.cwd(), 'assets', 'mockups', refFileName);
-        if (fs.existsSync(refPath)) {
-            referenceImageBuffer = fs.readFileSync(refPath);
-        } else {
-            console.warn(`Reference image not found at: ${refPath}. Falling back to text-only generation for pose.`);
-        }
-
-        // Базовая инструкция: генерируем фотореалистичную студийную съемку с нуля по плоскому эскизу
-        const BASE_POSITIVE_PROMPT = referenceImageBuffer 
-            ? `You are an expert fashion retoucher. You are provided with TWO images.
-Image 1 (Pose Reference): A photo of a model.
-Image 2 (Garment Design): A flat lay of a ${garmentDescription} with a specific design.
-
-TASK: Generate a photorealistic image of a handsome ${gender} wearing the ${garmentColor} ${garmentDescription} from Image 2.
-CRITICAL: The model MUST be ${poseDescription}.
-If Image 1 is provided, use its lighting, camera angle, and general vibe, but ensure the pose strictly matches: "${poseDescription}".
-
-CRITICAL PLACEMENT RULES:
-- First, carefully analyze WHERE the logo/graphic is located on the flat garment in Image 2.
-- You MUST place the graphic in that EXACT same relative position on the 3D model. 
-- If the graphic is at the bottom in Image 2, it MUST be at the bottom on the model. DO NOT automatically put it on the chest!
-- The garment color MUST be exactly ${garmentColor}.`
-            : `Generate a photorealistic studio fashion portrait of a handsome ${gender} wearing a ${garmentColor} ${garmentDescription}. CRITICAL: The model MUST be ${poseDescription}. The design, logo placement, and scale on the garment MUST EXACTLY match the provided reference image. Translate the flat 2D clothing design into a realistic 3D worn garment with natural folds and studio lighting.`;
+        const personDescription = modelGender === 'woman' ? 'woman model' : 'man model';
+        const BASE_POSITIVE_PROMPT = `Generate a photorealistic full-body studio fashion photo of a ${personDescription} wearing a t-shirt.
+Use the uploaded flat garment design image as the authoritative source for the t-shirt visual design.
+CRITICAL: Keep the logo/text layout, placement, scale, spacing, and proportions exactly as in the provided garment image.
+Transform the flat design into a realistic worn t-shirt with natural folds, fabric tension, and physically correct lighting.`;
 
         // Негативный промпт: отсекаем частые ошибки генерации людей и одежды
-        const NEGATIVE_PROMPT = "ugly, deformed face, unrealistic proportions, distorted logo, bad anatomy, text rendering errors, wrong garment color, flat, 2D overlay, floating text, sticker-like, ignored shadows, mismatched lighting, digital artifact, changed pose, changed camera angle.";
+        const NEGATIVE_PROMPT = 'ugly, deformed face, unrealistic proportions, distorted logo, bad anatomy, text rendering errors, wrong garment color';
 
-        // Формируем финальный промпт
-        const specificPrompt = PRINT_PROMPTS[printType];
-        const finalPrompt = `${BASE_POSITIVE_PROMPT} ${specificPrompt} NEGATIVE PROMPT: ${NEGATIVE_PROMPT}`;
+        // Формируем финальный промпт с жесткой фиксацией одного профиля печати
+        const selectedProfile = PRINT_PROFILES[printType];
+        const finalPrompt = `${BASE_POSITIVE_PROMPT}
+PRINT METHOD ID: ${printType}
+PRINT METHOD NAME: ${selectedProfile.label}
+PRINT TEXTURE REQUIREMENT: ${selectedProfile.prompt}
+STYLE BOOST: ${selectedProfile.boost}
+CRITICAL: apply ONLY this print method appearance. Do NOT blend styles from other methods.
+NEGATIVE PROMPT: ${NEGATIVE_PROMPT}`;
 
-        // Собираем массив контента для ИИ
-        const contentsArray = [finalPrompt];
-        
-        // Если есть референс позы (Image 1), добавляем его первым
-        if (referenceImageBuffer) {
-            contentsArray.push({
-                inlineData: {
-                    mimeType: referenceMimeType,
-                    data: referenceImageBuffer.toString('base64')
-                }
-            });
-        }
-        
-        // Добавляем эскиз от фронтенда (Image 2)
-        contentsArray.push({
-            inlineData: {
-                mimeType: mimeTypeIn,
-                data: garmentBuffer.toString('base64')
-            }
-        });
+        console.log(`[apply-print] method=${printType}, gender=${modelGender}`);
 
         // Отправляем запрос к Gemini (gemini-2.5-flash-image) через generateContent
         const response = await ai.models.generateContent({
             model: 'gemini-2.5-flash-image', 
-            contents: contentsArray
+            contents: [
+                finalPrompt,
+                {
+                    inlineData: {
+                        mimeType: mimeTypeIn,
+                        data: garmentBuffer.toString('base64'),
+                    },
+                },
+            ],
         });
 
         // Извлекаем картинку из ответа
